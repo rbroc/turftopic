@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal, Optional, Union
 
 import numpy as np
@@ -11,6 +12,7 @@ from sklearn.metrics.pairwise import cosine_distances
 from sklearn.preprocessing import label_binarize
 
 from turftopic.base import ContextualModel, Encoder
+from turftopic.dynamic import DynamicTopicModel, bin_timestamps
 from turftopic.feature_importance import (
     cluster_centroid_distance,
     ctf_idf,
@@ -31,6 +33,10 @@ Alternatively you can reduce the number of topics in the model by specifying
 the desired reduced number on initialization.
 
 ClusteringTopicModel(n_reduce_to=10)
+"""
+
+feature_message = """
+feature_importance must be one of 'soft-c-tf-idf', 'c-tf-idf', 'centroid'
 """
 
 
@@ -62,20 +68,25 @@ def smallest_hierarchical_join(
 
 
 def calculate_topic_vectors(
-    cluster_labels: np.ndarray, embeddings: np.ndarray
+    cluster_labels: np.ndarray, embeddings: np.ndarray,
+    time_index: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Calculates topic centroids."""
     centroids = []
     unique_labels = np.unique(cluster_labels)
     unique_labels = np.sort(unique_labels)
     for label in unique_labels:
-        centroid = np.mean(embeddings[cluster_labels == label], axis=0)
+        label_index = cluster_labels == label
+        if time_index is not None:
+            label_index = label_index * time_index
+        label_embeddings = embeddings[label_index]
+        centroid = np.mean(label_embeddings, axis=0)
         centroids.append(centroid)
     centroids = np.stack(centroids)
     return centroids
 
 
-class ClusteringTopicModel(ContextualModel, ClusterMixin):
+class ClusteringTopicModel(ContextualModel, ClusterMixin, DynamicTopicModel):
     """Topic models, which assume topics to be clusters of documents
     in semantic space.
     Models also include a dimensionality reduction step to aid clustering.
@@ -138,6 +149,10 @@ class ClusteringTopicModel(ContextualModel, ClusterMixin):
         reduction_method: Literal["agglomerative", "smallest"] = "agglomerative",
     ):
         self.encoder = encoder
+        if feature_importance not in ["c-tf-idf", 
+                                      "soft-c-tf-idf", 
+                                      "centroid"]:
+            raise ValueError(feature_message)
         if isinstance(encoder, int):
             raise TypeError(integer_message)
         if isinstance(encoder, str):
@@ -159,6 +174,7 @@ class ClusteringTopicModel(ContextualModel, ClusterMixin):
         self.feature_importance = feature_importance
         self.n_reduce_to = n_reduce_to
         self.reduction_method = reduction_method
+        self.components_ = None
 
     def _merge_agglomerative(self, n_reduce_to: int) -> np.ndarray:
         n_topics = self.components_.shape[0]
@@ -285,3 +301,56 @@ class ClusteringTopicModel(ContextualModel, ClusterMixin):
     ):
         labels = self.fit_predict(raw_documents, y, embeddings)
         return label_binarize(labels, classes=self.classes_)
+
+    def fit_transform_dynamic(
+        self,
+        raw_documents,
+        timestamps: list[datetime],
+        embeddings: Optional[np.ndarray] = None,
+        bins: Union[int, list[datetime]] = 10,
+    ):
+        time_labels, self.time_bin_edges = bin_timestamps(timestamps, bins)
+        temporal_components = []
+        temporal_importances = []
+        if embeddings is None:
+            embeddings = self.encoder_.encode(raw_documents)
+        for i_timebin in np.arange(len(self.time_bin_edges) - 1):
+            if self.components_ is not None:
+                doc_topic_matrix = label_binarize(self.labels_, classes=self.classes_)
+            else:
+                doc_topic_matrix = self.fit_transform(raw_documents, embeddings=embeddings)
+            topic_importances = doc_topic_matrix[time_labels == i_timebin].sum(axis=0)
+            topic_importances = topic_importances / topic_importances.sum()
+            t_doc_term_matrix = self.doc_term_matrix[time_labels == i_timebin]
+            t_doc_topic_matrix = doc_topic_matrix[time_labels == i_timebin]
+            if "c-tf-idf" in self.feature_importance:
+                if self.feature_importance == 'soft-c-tf-idf':
+                    components = soft_ctf_idf(
+                        t_doc_topic_matrix,
+                        t_doc_term_matrix
+                    )
+                elif self.feature_importance == 'c-tf-idf':
+                    components = ctf_idf(t_doc_topic_matrix, t_doc_term_matrix)
+            elif self.feature_importance == 'centroid':
+                time_index = time_labels == i_timebin
+                t_topic_vectors = calculate_topic_vectors(
+                    self.labels_, embeddings, time_index,
+                )
+                topic_mask = np.isnan(t_topic_vectors).all(
+                    axis=1, keepdims=True
+                )
+                t_topic_vectors[:] = 0
+                components = cluster_centroid_distance(
+                    t_topic_vectors,
+                    self.vocab_embeddings,
+                    metric="cosine",
+                )
+                components *= topic_mask
+                mask_terms = t_doc_term_matrix.sum(axis=0).astype(np.float64)
+                mask_terms[mask_terms == 0] = np.nan
+                components *= mask_terms
+            temporal_components.append(components)
+            temporal_importances.append(topic_importances)
+        self.temporal_components_ = np.stack(temporal_components)
+        self.temporal_importance_ = np.stack(temporal_importances)
+        return doc_topic_matrix
